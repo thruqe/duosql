@@ -1,0 +1,67 @@
+version: "3"
+
+env:
+  PATH:
+    sh: echo "$(go env GOPATH)/bin:$HOME/go/bin:$PATH"
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  install:
+    desc: Install and verify Go module dependencies
+    cmds:
+      - go mod download
+      - go mod tidy
+
+  fix:
+    desc: Apply go fix modernizers across the codebase
+    cmds:
+      - go fix ./...
+
+  fmt:
+    desc: Format and vet all Go source files
+    cmds:
+      - go fmt ./...
+      - gofmt -w -s .
+      - go vet ./...
+
+  cyclo:
+    desc: Verify cyclomatic complexity stays strictly within threshold (<= 15)
+    cmds:
+      - gocyclo -over 15 .
+
+  deadcode:
+    desc: Analyze unreachable functions across the library and test suite
+    cmds:
+      - deadcode -test ./...
+
+  test:
+    desc: Run production test suite with race detection enabled
+    cmds:
+      - go test -v -race -timeout 60s ./...
+
+  check:
+    desc: Run all quality gates (formatting, modernizer, complexity, dead code, race tests)
+    cmds:
+      - task: fmt
+      - task: fix
+      - task: cyclo
+      - task: deadcode
+      - task: test
+
+  update:
+    desc: Upgrade Go module dependencies
+    cmds:
+      - go get -u ./...
+      - go mod tidy
+
+  clean:
+    desc: Remove temporary files and test artifacts
+    cmds:
+      - cmd: rm -rf bin/ tmp/ coverage.txt
+        platforms: [linux, darwin]
+      - cmd: powershell -Command "if (Test-Path coverage.txt) { Remove-Item -Force coverage.txt }"
+        platforms: [windows]
