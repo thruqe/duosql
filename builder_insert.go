@@ -17,9 +17,10 @@ type InsertBuilder[T any] struct {
 	models          []*T
 	maps            []map[string]any
 	conflictTargets []string
-	conflictDoNot   bool
-	conflictUpdates []string
-	returningCols   []string
+	conflictDoNot      bool
+	conflictUpdates    []string
+	conflictRawUpdates []string
+	returningCols      []string
 }
 
 // Insert creates a new insert query builder for entity type T.
@@ -71,6 +72,16 @@ func (b *InsertBuilder[T]) OnConflictDoUpdate(targets []string, updateCols []str
 	b.conflictTargets = targets
 	b.conflictDoNot = false
 	b.conflictUpdates = updateCols
+	b.conflictRawUpdates = nil
+	return b
+}
+
+// OnConflictDoUpdateRaw configures an upsert to update using explicit SQL assignment expressions.
+func (b *InsertBuilder[T]) OnConflictDoUpdateRaw(targets []string, rawAssignments []string) *InsertBuilder[T] {
+	b.conflictTargets = targets
+	b.conflictDoNot = false
+	b.conflictUpdates = nil
+	b.conflictRawUpdates = rawAssignments
 	return b
 }
 
@@ -225,6 +236,10 @@ func (b *InsertBuilder[T]) compileConflict(d Dialect) string {
 			return fmt.Sprintf("ON CONFLICT %s DO NOTHING", targetClause)
 		}
 		return "ON CONFLICT DO NOTHING"
+	}
+
+	if len(b.conflictRawUpdates) > 0 {
+		return fmt.Sprintf("ON CONFLICT %s DO UPDATE SET %s", targetClause, strings.Join(b.conflictRawUpdates, ", "))
 	}
 
 	var sets []string

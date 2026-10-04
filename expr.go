@@ -402,6 +402,20 @@ func Desc(column string) OrderByExpr {
 	return &orderByClause{column: column, direction: "DESC"}
 }
 
+// rawOrderBy implements OrderByExpr with an arbitrary SQL expression.
+type rawOrderBy struct {
+	expr string
+}
+
+func (r *rawOrderBy) ToOrderBySQL(ctx *BuildContext) string {
+	return r.expr
+}
+
+// RawOrderBy creates an OrderByExpr from a raw SQL expression (such as CASE statements).
+func RawOrderBy(expr string) OrderByExpr {
+	return &rawOrderBy{expr: expr}
+}
+
 // SubqueryBuilder compiles an executable subquery fragment.
 type SubqueryBuilder interface {
 	Build() (string, []any, error)
