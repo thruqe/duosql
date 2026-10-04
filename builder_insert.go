@@ -6,15 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 )
 
 // InsertBuilder configures and executes SQL INSERT and upsert operations.
 type InsertBuilder[T any] struct {
-	executor        ExecExecutor
-	tableName       string
-	columns         []string
-	models          []*T
+	executor              ExecExecutor
+	tableName             string
+	columns               []string
+	models                []*T
 	maps                  []map[string]any
 	conflictTargets       []string
 	conflictDoNot         bool
@@ -230,6 +231,36 @@ func (b *InsertBuilder[T]) extractFromMaps() ([]string, [][]any, error) {
 	return cols, rows, nil
 }
 
+func (b *InsertBuilder[T]) resolveConflictUpdateCols() []string {
+	if b.conflictAutoUpdateAll {
+		meta, err := GetModelMetadata[T]()
+		if err != nil {
+			return b.conflictUpdates
+		}
+		targetSet := make(map[string]bool, len(b.conflictTargets))
+		for _, t := range b.conflictTargets {
+			targetSet[t] = true
+		}
+		updates := make([]string, 0, len(meta.Fields))
+		for _, f := range meta.Fields {
+			if !targetSet[f.ColumnName] && !f.IsPrimaryKey && !f.IsCreatedAt {
+				updates = append(updates, f.ColumnName)
+			}
+		}
+		return updates
+	}
+
+	updates := b.conflictUpdates
+	if len(updates) > 0 {
+		if meta, err := GetModelMetadata[T](); err == nil && meta.UpdatedAtCol != "" {
+			if !slices.Contains(updates, meta.UpdatedAtCol) {
+				updates = append(updates, meta.UpdatedAtCol)
+			}
+		}
+	}
+	return updates
+}
+
 func (b *InsertBuilder[T]) compileConflict(d Dialect) string {
 	if !b.conflictDoNot && len(b.conflictUpdates) == 0 && len(b.conflictRawUpdates) == 0 && !b.conflictAutoUpdateAll {
 		return ""
@@ -255,35 +286,7 @@ func (b *InsertBuilder[T]) compileConflict(d Dialect) string {
 		return fmt.Sprintf("ON CONFLICT %s DO UPDATE SET %s", targetClause, strings.Join(b.conflictRawUpdates, ", "))
 	}
 
-	updates := b.conflictUpdates
-	if b.conflictAutoUpdateAll {
-		meta, err := GetModelMetadata[T]()
-		if err == nil {
-			targetSet := make(map[string]bool, len(b.conflictTargets))
-			for _, t := range b.conflictTargets {
-				targetSet[t] = true
-			}
-			for _, f := range meta.Fields {
-				if !targetSet[f.ColumnName] && !f.IsPrimaryKey && !f.IsCreatedAt {
-					updates = append(updates, f.ColumnName)
-				}
-			}
-		}
-	} else if len(updates) > 0 {
-		if meta, err := GetModelMetadata[T](); err == nil && meta.UpdatedAtCol != "" {
-			hasUpdated := false
-			for _, u := range updates {
-				if u == meta.UpdatedAtCol {
-					hasUpdated = true
-					break
-				}
-			}
-			if !hasUpdated {
-				updates = append(updates, meta.UpdatedAtCol)
-			}
-		}
-	}
-
+	updates := b.resolveConflictUpdateCols()
 	var sets []string
 	for _, col := range updates {
 		qCol := d.QuoteIdentifier(col)

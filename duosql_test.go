@@ -1147,6 +1147,31 @@ func TestAutomaticTimestampsAndUpsertAll(t *testing.T) {
 	if updatedArt.Title != "Go 1.27 Modernization (Updated)" {
 		t.Errorf("expected updated title, got %s", updatedArt.Title)
 	}
+
+	// 3. OnConflictDoUpdateRaw and RawOrderBy
+	artRaw := &Article{
+		Slug:  "go-127",
+		Title: "Go 1.27 Modernization (Raw Update)",
+	}
+	_, err = duosql.Insert[Article](db).
+		Into("articles").
+		Values(artRaw).
+		OnConflictDoUpdateRaw([]string{"slug"}, []string{"title = 'Go 1.27 Modernization (Raw Overwrite)'"}).
+		Exec(ctx)
+	if err != nil {
+		t.Fatalf("OnConflictDoUpdateRaw failed: %v", err)
+	}
+
+	rawUpdated, err := duosql.Select[Article](db).
+		From("articles").
+		OrderBy(duosql.RawOrderBy("slug ASC")).
+		One(ctx)
+	if err != nil {
+		t.Fatalf("fetch raw updated article failed: %v", err)
+	}
+	if rawUpdated.Title != "Go 1.27 Modernization (Raw Overwrite)" {
+		t.Errorf("expected raw updated title, got %s", rawUpdated.Title)
+	}
 }
 
 func containsStr(s, sub string) bool {

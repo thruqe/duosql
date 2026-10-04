@@ -134,24 +134,26 @@ func (b *UpdateBuilder[T]) Returning(cols ...string) *UpdateBuilder[T] {
 	return b
 }
 
-func (b *UpdateBuilder[T]) Build() (string, []any, error) {
-	if meta, err := GetModelMetadata[T](); err == nil && meta.UpdatedAtCol != "" {
-		hasUpdated := false
-		for _, a := range b.assignments {
-			if a.column == meta.UpdatedAtCol {
-				hasUpdated = true
-				break
-			}
-		}
-		if !hasUpdated {
-			idx := meta.ColumnToIdx[meta.UpdatedAtCol]
-			if meta.Fields[idx].FieldType.Kind() == reflect.Int64 {
-				b.assignments = append(b.assignments, setAssignment{column: meta.UpdatedAtCol, value: time.Now().Unix()})
-			} else {
-				b.assignments = append(b.assignments, setAssignment{column: meta.UpdatedAtCol, value: time.Now().UTC()})
-			}
+func (b *UpdateBuilder[T]) applyAutoUpdatedAt() {
+	meta, err := GetModelMetadata[T]()
+	if err != nil || meta.UpdatedAtCol == "" {
+		return
+	}
+	for _, a := range b.assignments {
+		if a.column == meta.UpdatedAtCol {
+			return
 		}
 	}
+	idx := meta.ColumnToIdx[meta.UpdatedAtCol]
+	if meta.Fields[idx].FieldType.Kind() == reflect.Int64 {
+		b.assignments = append(b.assignments, setAssignment{column: meta.UpdatedAtCol, value: time.Now().Unix()})
+	} else {
+		b.assignments = append(b.assignments, setAssignment{column: meta.UpdatedAtCol, value: time.Now().UTC()})
+	}
+}
+
+func (b *UpdateBuilder[T]) Build() (string, []any, error) {
+	b.applyAutoUpdatedAt()
 
 	if len(b.assignments) == 0 {
 		return "", nil, errors.New("duosql: update statement requires at least one Set assignment")

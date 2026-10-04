@@ -87,30 +87,35 @@ func parseStructMetadata(t reflect.Type) *ModelMetadata {
 
 		meta.Fields = append(meta.Fields, info)
 		meta.ColumnToIdx[info.ColumnName] = len(meta.Fields) - 1
-
-		if info.IsPrimaryKey && meta.PKColumn == "" {
-			meta.PKColumn = info.ColumnName
-		}
-		if info.IsSoftDelete && meta.SoftDeleteColumn == "" {
-			meta.SoftDeleteColumn = info.ColumnName
-		}
-		if info.IsCreatedAt && meta.CreatedAtCol == "" {
-			meta.CreatedAtCol = info.ColumnName
-		}
-		if info.IsUpdatedAt && meta.UpdatedAtCol == "" {
-			meta.UpdatedAtCol = info.ColumnName
-		}
+		assignSpecialColumns(meta, info)
 	}
 
+	applyIdConvention(meta)
+	return meta
+}
+
+func assignSpecialColumns(meta *ModelMetadata, info FieldInfo) {
+	if info.IsPrimaryKey && meta.PKColumn == "" {
+		meta.PKColumn = info.ColumnName
+	}
+	if info.IsSoftDelete && meta.SoftDeleteColumn == "" {
+		meta.SoftDeleteColumn = info.ColumnName
+	}
+	if info.IsCreatedAt && meta.CreatedAtCol == "" {
+		meta.CreatedAtCol = info.ColumnName
+	}
+	if info.IsUpdatedAt && meta.UpdatedAtCol == "" {
+		meta.UpdatedAtCol = info.ColumnName
+	}
+}
+
+func applyIdConvention(meta *ModelMetadata) {
 	if meta.PKColumn == "" && len(meta.Fields) > 0 {
-		// Convention fallback: if "id" exists, mark as PK.
 		if idx, exists := meta.ColumnToIdx["id"]; exists {
 			meta.Fields[idx].IsPrimaryKey = true
 			meta.PKColumn = "id"
 		}
 	}
-
-	return meta
 }
 
 func parseFieldInfo(idx int, field reflect.StructField) FieldInfo {
@@ -230,7 +235,7 @@ func (m *ModelMetadata) ExtractInsertMap(val reflect.Value, skipAuto bool) map[s
 }
 
 func applyTimestamp(fieldVal reflect.Value, now time.Time, data map[string]any, colName string) bool {
-	if fieldVal.Type() == reflect.TypeOf(time.Time{}) {
+	if fieldVal.Type() == reflect.TypeFor[time.Time]() {
 		tVal := fieldVal.Interface().(time.Time)
 		if tVal.IsZero() {
 			if fieldVal.CanSet() {
