@@ -303,6 +303,12 @@ func (t *TableBuilder) Unique(cols ...string) {
 	}
 }
 
+// Timestamps adds standard created_at and updated_at TIMESTAMP columns with CURRENT_TIMESTAMP default.
+func (t *TableBuilder) Timestamps() {
+	t.Timestamp("created_at").NotNull().Default("CURRENT_TIMESTAMP")
+	t.Timestamp("updated_at").NotNull().Default("CURRENT_TIMESTAMP")
+}
+
 // SchemaBuilder provides DDL execution workflows for database migrations.
 type SchemaBuilder struct {
 	executor ExecExecutor
@@ -365,6 +371,39 @@ func (s *SchemaBuilder) HasTable(ctx context.Context, tableName string) (bool, e
 		return false, fmt.Errorf("duosql: check table existence: %w", err)
 	}
 	return true, nil
+}
+
+// HasColumn reports whether the specified column exists within a database table.
+func (s *SchemaBuilder) HasColumn(ctx context.Context, tableName, columnName string) (bool, error) {
+	if s.dialect.Kind() == DialectSQLite {
+		rows, err := s.executor.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", s.dialect.QuoteIdentifier(tableName)))
+		if err != nil {
+			return false, err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var cid int
+			var name, cType string
+			var notNull, pk int
+			var dfltValue any
+			if err := rows.Scan(&cid, &name, &cType, &notNull, &dfltValue, &pk); err == nil {
+				if strings.EqualFold(name, columnName) {
+					return true, nil
+				}
+			}
+		}
+		return false, rows.Err()
+	}
+
+	var exists bool
+	err := s.executor.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns 
+			WHERE table_name = $1 AND column_name = $2
+		)
+	`, strings.ToLower(tableName), strings.ToLower(columnName)).Scan(&exists)
+	return exists, err
 }
 
 // CreateTableBuilder compiles and executes table creation DDL.

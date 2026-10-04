@@ -19,6 +19,8 @@ type FieldInfo struct {
 	IsAuto       bool
 	IsJSON       bool
 	IsSoftDelete bool
+	IsCreatedAt  bool
+	IsUpdatedAt  bool
 	FieldType    reflect.Type
 }
 
@@ -30,6 +32,8 @@ type ModelMetadata struct {
 	ColumnToIdx      map[string]int
 	PKColumn         string
 	SoftDeleteColumn string
+	CreatedAtCol     string
+	UpdatedAtCol     string
 }
 
 var modelCache sync.Map // map[reflect.Type]*ModelMetadata
@@ -84,6 +88,12 @@ func parseStructMetadata(t reflect.Type) *ModelMetadata {
 		if info.IsSoftDelete && meta.SoftDeleteColumn == "" {
 			meta.SoftDeleteColumn = info.ColumnName
 		}
+		if info.IsCreatedAt && meta.CreatedAtCol == "" {
+			meta.CreatedAtCol = info.ColumnName
+		}
+		if info.IsUpdatedAt && meta.UpdatedAtCol == "" {
+			meta.UpdatedAtCol = info.ColumnName
+		}
 	}
 
 	if meta.PKColumn == "" && len(meta.Fields) > 0 {
@@ -103,7 +113,7 @@ func parseFieldInfo(idx int, field reflect.StructField) FieldInfo {
 		tag = field.Tag.Get("db")
 	}
 
-	colName, isPK, isAuto, isJSON, isSoft := parseTagOptions(tag, field.Name)
+	colName, isPK, isAuto, isJSON, isSoft, isCreated, isUpdated := parseTagOptions(tag, field.Name)
 
 	return FieldInfo{
 		Index:        idx,
@@ -113,22 +123,26 @@ func parseFieldInfo(idx int, field reflect.StructField) FieldInfo {
 		IsAuto:       isAuto,
 		IsJSON:       isJSON,
 		IsSoftDelete: isSoft,
+		IsCreatedAt:  isCreated,
+		IsUpdatedAt:  isUpdated,
 		FieldType:    field.Type,
 	}
 }
 
-func parseTagOptions(tag, fieldName string) (string, bool, bool, bool, bool) {
+func parseTagOptions(tag, fieldName string) (string, bool, bool, bool, bool, bool, bool) {
 	colName := ""
 	isPK := false
 	isAuto := false
 	isJSON := false
 	isSoft := false
+	isCreated := false
+	isUpdated := false
 
 	if tag != "" {
 		parts := strings.Split(tag, ",")
 		colName = strings.TrimSpace(parts[0])
 		for _, opt := range parts[1:] {
-			switch strings.TrimSpace(opt) {
+			switch strings.ToLower(strings.TrimSpace(opt)) {
 			case "pk":
 				isPK = true
 			case "auto":
@@ -137,6 +151,10 @@ func parseTagOptions(tag, fieldName string) (string, bool, bool, bool, bool) {
 				isJSON = true
 			case "soft_delete", "softdelete":
 				isSoft = true
+			case "created_at", "createdat", "auto_now_add":
+				isCreated = true
+			case "updated_at", "updatedat", "auto_now":
+				isUpdated = true
 			}
 		}
 	}
@@ -145,7 +163,15 @@ func parseTagOptions(tag, fieldName string) (string, bool, bool, bool, bool) {
 		colName = toSnakeCase(fieldName)
 	}
 
-	return colName, isPK, isAuto, isJSON, isSoft
+	lowerCol := strings.ToLower(colName)
+	if lowerCol == "created_at" || strings.EqualFold(fieldName, "CreatedAt") {
+		isCreated = true
+	}
+	if lowerCol == "updated_at" || strings.EqualFold(fieldName, "UpdatedAt") {
+		isUpdated = true
+	}
+
+	return colName, isPK, isAuto, isJSON, isSoft, isCreated, isUpdated
 }
 
 // ColumnNames returns all declared column names in the model.
@@ -158,18 +184,33 @@ func (m *ModelMetadata) ColumnNames() []string {
 }
 
 // ExtractInsertMap converts a model instance into a map of column names to values,
-// optionally skipping auto-generated columns when instructed.
+// optionally skipping auto-generated columns and automatically populating timestamps.
 func (m *ModelMetadata) ExtractInsertMap(val reflect.Value, skipAuto bool) map[string]any {
 	for val.Kind() == reflect.Pointer {
 		val = val.Elem()
 	}
 
 	data := make(map[string]any, len(m.Fields))
+	now := time.Now().UTC()
+
 	for _, f := range m.Fields {
 		if skipAuto && f.IsAuto {
 			continue
 		}
 		fieldVal := val.Field(f.Index)
+
+		if f.IsCreatedAt {
+			if applyTimestamp(fieldVal, now, data, f.ColumnName) {
+				continue
+			}
+		}
+
+		if f.IsUpdatedAt {
+			if applyTimestamp(fieldVal, now, data, f.ColumnName) {
+				continue
+			}
+		}
+
 		if f.IsJSON {
 			bytes, err := json.Marshal(fieldVal.Interface())
 			if err == nil {
@@ -180,6 +221,27 @@ func (m *ModelMetadata) ExtractInsertMap(val reflect.Value, skipAuto bool) map[s
 		data[f.ColumnName] = fieldVal.Interface()
 	}
 	return data
+}
+
+func applyTimestamp(fieldVal reflect.Value, now time.Time, data map[string]any, colName string) bool {
+	if fieldVal.Type() == reflect.TypeOf(time.Time{}) {
+		tVal := fieldVal.Interface().(time.Time)
+		if tVal.IsZero() {
+			if fieldVal.CanSet() {
+				fieldVal.Set(reflect.ValueOf(now))
+			}
+			data[colName] = now
+			return true
+		}
+	} else if fieldVal.Kind() == reflect.Int64 && fieldVal.Int() == 0 {
+		u := now.Unix()
+		if fieldVal.CanSet() {
+			fieldVal.SetInt(u)
+		}
+		data[colName] = u
+		return true
+	}
+	return false
 }
 
 // ScanTargets prepares scan destination pointers for the SQL driver's Rows.Scan

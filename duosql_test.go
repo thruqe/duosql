@@ -1076,6 +1076,79 @@ func TestLivePostgresUpsertAndTx(t *testing.T) {
 	}
 }
 
+func TestAutomaticTimestampsAndUpsertAll(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	type Article struct {
+		ID        int64     `db:"id,pk,auto"`
+		Slug      string    `db:"slug"`
+		Title     string    `db:"title"`
+		CreatedAt time.Time `db:"created_at"`
+		UpdatedAt time.Time `db:"updated_at"`
+	}
+
+	err := db.Schema().CreateTable("articles", func(table *duosql.TableBuilder) {
+		table.BigInt("id").AutoIncrement()
+		table.String("slug").NotNull().Unique()
+		table.String("title").NotNull()
+		table.Timestamps()
+	}).IfNotExists().Exec(ctx)
+	if err != nil {
+		t.Fatalf("failed creating articles table: %v", err)
+	}
+
+	hasCol, err := db.Schema().HasColumn(ctx, "articles", "updated_at")
+	if err != nil || !hasCol {
+		t.Fatalf("expected HasColumn updated_at to be true: hasCol=%v, err=%v", hasCol, err)
+	}
+
+	// 1. Insert without setting timestamps - should be auto-populated
+	art := &Article{
+		Slug:  "go-127",
+		Title: "Go 1.27 Modernization",
+	}
+
+	_, err = duosql.Insert[Article](db).
+		Into("articles").
+		Values(art).
+		Exec(ctx)
+	if err != nil {
+		t.Fatalf("insert article failed: %v", err)
+	}
+
+	saved, err := duosql.Select[Article](db).From("articles").Where(duosql.Eq("slug", "go-127")).One(ctx)
+	if err != nil {
+		t.Fatalf("fetch article failed: %v", err)
+	}
+	if saved.CreatedAt.IsZero() || saved.UpdatedAt.IsZero() {
+		t.Fatalf("expected non-zero auto timestamps, got created=%v, updated=%v", saved.CreatedAt, saved.UpdatedAt)
+	}
+
+	// 2. OnConflictDoUpdateAll
+	artUpdate := &Article{
+		Slug:  "go-127",
+		Title: "Go 1.27 Modernization (Updated)",
+	}
+	_, err = duosql.Insert[Article](db).
+		Into("articles").
+		Values(artUpdate).
+		OnConflictDoUpdateAll("slug").
+		Exec(ctx)
+	if err != nil {
+		t.Fatalf("OnConflictDoUpdateAll failed: %v", err)
+	}
+
+	updatedArt, err := duosql.Select[Article](db).From("articles").Where(duosql.Eq("slug", "go-127")).One(ctx)
+	if err != nil {
+		t.Fatalf("fetch updated article failed: %v", err)
+	}
+	if updatedArt.Title != "Go 1.27 Modernization (Updated)" {
+		t.Errorf("expected updated title, got %s", updatedArt.Title)
+	}
+}
+
 func containsStr(s, sub string) bool {
 	return len(s) >= len(sub) && (s == sub || stringSearch(s, sub))
 }

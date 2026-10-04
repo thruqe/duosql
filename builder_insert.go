@@ -15,12 +15,13 @@ type InsertBuilder[T any] struct {
 	tableName       string
 	columns         []string
 	models          []*T
-	maps            []map[string]any
-	conflictTargets []string
-	conflictDoNot      bool
-	conflictUpdates    []string
-	conflictRawUpdates []string
-	returningCols      []string
+	maps                  []map[string]any
+	conflictTargets       []string
+	conflictDoNot         bool
+	conflictAutoUpdateAll bool
+	conflictUpdates       []string
+	conflictRawUpdates    []string
+	returningCols         []string
 }
 
 // Insert creates a new insert query builder for entity type T.
@@ -71,7 +72,18 @@ func (b *InsertBuilder[T]) OnConflictDoNothing(targets ...string) *InsertBuilder
 func (b *InsertBuilder[T]) OnConflictDoUpdate(targets []string, updateCols []string) *InsertBuilder[T] {
 	b.conflictTargets = targets
 	b.conflictDoNot = false
+	b.conflictAutoUpdateAll = false
 	b.conflictUpdates = updateCols
+	b.conflictRawUpdates = nil
+	return b
+}
+
+// OnConflictDoUpdateAll configures an upsert to automatically update all non-conflict columns from the model.
+func (b *InsertBuilder[T]) OnConflictDoUpdateAll(targets ...string) *InsertBuilder[T] {
+	b.conflictTargets = targets
+	b.conflictDoNot = false
+	b.conflictAutoUpdateAll = true
+	b.conflictUpdates = nil
 	b.conflictRawUpdates = nil
 	return b
 }
@@ -80,6 +92,7 @@ func (b *InsertBuilder[T]) OnConflictDoUpdate(targets []string, updateCols []str
 func (b *InsertBuilder[T]) OnConflictDoUpdateRaw(targets []string, rawAssignments []string) *InsertBuilder[T] {
 	b.conflictTargets = targets
 	b.conflictDoNot = false
+	b.conflictAutoUpdateAll = false
 	b.conflictUpdates = nil
 	b.conflictRawUpdates = rawAssignments
 	return b
@@ -218,7 +231,7 @@ func (b *InsertBuilder[T]) extractFromMaps() ([]string, [][]any, error) {
 }
 
 func (b *InsertBuilder[T]) compileConflict(d Dialect) string {
-	if !b.conflictDoNot && len(b.conflictUpdates) == 0 && len(b.conflictRawUpdates) == 0 {
+	if !b.conflictDoNot && len(b.conflictUpdates) == 0 && len(b.conflictRawUpdates) == 0 && !b.conflictAutoUpdateAll {
 		return ""
 	}
 
@@ -242,8 +255,37 @@ func (b *InsertBuilder[T]) compileConflict(d Dialect) string {
 		return fmt.Sprintf("ON CONFLICT %s DO UPDATE SET %s", targetClause, strings.Join(b.conflictRawUpdates, ", "))
 	}
 
+	updates := b.conflictUpdates
+	if b.conflictAutoUpdateAll {
+		meta, err := GetModelMetadata[T]()
+		if err == nil {
+			targetSet := make(map[string]bool, len(b.conflictTargets))
+			for _, t := range b.conflictTargets {
+				targetSet[t] = true
+			}
+			for _, f := range meta.Fields {
+				if !targetSet[f.ColumnName] && !f.IsPrimaryKey && !f.IsCreatedAt {
+					updates = append(updates, f.ColumnName)
+				}
+			}
+		}
+	} else if len(updates) > 0 {
+		if meta, err := GetModelMetadata[T](); err == nil && meta.UpdatedAtCol != "" {
+			hasUpdated := false
+			for _, u := range updates {
+				if u == meta.UpdatedAtCol {
+					hasUpdated = true
+					break
+				}
+			}
+			if !hasUpdated {
+				updates = append(updates, meta.UpdatedAtCol)
+			}
+		}
+	}
+
 	var sets []string
-	for _, col := range b.conflictUpdates {
+	for _, col := range updates {
 		qCol := d.QuoteIdentifier(col)
 		sets = append(sets, fmt.Sprintf("%s = EXCLUDED.%s", qCol, qCol))
 	}
