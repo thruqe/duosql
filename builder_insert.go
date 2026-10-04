@@ -218,7 +218,7 @@ func (b *InsertBuilder[T]) extractFromMaps() ([]string, [][]any, error) {
 }
 
 func (b *InsertBuilder[T]) compileConflict(d Dialect) string {
-	if !b.conflictDoNot && len(b.conflictUpdates) == 0 {
+	if !b.conflictDoNot && len(b.conflictUpdates) == 0 && len(b.conflictRawUpdates) == 0 {
 		return ""
 	}
 
