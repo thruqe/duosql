@@ -62,9 +62,15 @@ func GetModelMetadata[T any]() (*ModelMetadata, error) {
 }
 
 func parseStructMetadata(t reflect.Type) *ModelMetadata {
+	tableName := toSnakeCase(t.Name()) + "s"
+	zero := reflect.New(t).Interface()
+	if namer, ok := zero.(interface{ TableName() string }); ok {
+		tableName = namer.TableName()
+	}
+
 	meta := &ModelMetadata{
 		Type:        t,
-		TableName:   toSnakeCase(t.Name()) + "s",
+		TableName:   tableName,
 		ColumnToIdx: make(map[string]int),
 	}
 
