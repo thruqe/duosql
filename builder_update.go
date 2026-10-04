@@ -47,7 +47,13 @@ func (b *UpdateBuilder[T]) Table(table string) *UpdateBuilder[T] {
 
 // Set adds a single column update assignment.
 func (b *UpdateBuilder[T]) Set(column string, value any) *UpdateBuilder[T] {
-	b.assignments = append(b.assignments, setAssignment{column: column, value: value})
+	v := value
+	if isProtoType(reflect.TypeOf(value)) {
+		if bytes, err := marshalProto(value); err == nil {
+			v = bytes
+		}
+	}
+	b.assignments = append(b.assignments, setAssignment{column: column, value: v})
 	return b
 }
 
@@ -92,7 +98,7 @@ func (b *UpdateBuilder[T]) SetRaw(column string, expr string, args ...any) *Upda
 // SetMap merges multiple column assignments from a map.
 func (b *UpdateBuilder[T]) SetMap(values map[string]any) *UpdateBuilder[T] {
 	for k, v := range values {
-		b.assignments = append(b.assignments, setAssignment{column: k, value: v})
+		b.Set(k, v)
 	}
 	return b
 }

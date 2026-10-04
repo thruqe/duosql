@@ -182,6 +182,100 @@ admins, err := duosql.Select[User](db).
 	All(ctx)
 ```
 
+### 9. Automatic Timestamp Defaults & Automatic Upserts
+
+```go
+type Article struct {
+	ID        int64     `duo:"id,pk,auto"`
+	Slug      string    `duo:"slug,unique"`
+	Title     string    `duo:"title"`
+	CreatedAt time.Time `duo:"created_at"` // Auto-populated if zero during insert
+	UpdatedAt time.Time `duo:"updated_at"` // Auto-refreshed on updates & upserts
+}
+
+// Full Upsert: Automatically discovers non-conflict columns, preserves created_at, and refreshes updated_at
+_, err = duosql.Insert[Article](db).
+	Values(&Article{Slug: "go-127", Title: "Go Modernized"}).
+	OnConflictDoUpdateAll("slug").
+	Exec(ctx)
+```
+
+### 10. Built-in Model Validation Engine
+
+Zero-dependency, production-grade validation built directly into model lifecycles:
+
+```go
+type RegisterRequest struct {
+	Username string `validate:"required,min=3,max=30,alphanum"`
+	Email    string `validate:"required,email"`
+	Role     string `validate:"in=admin|editor|viewer"`
+	Age      int    `validate:"min=18,max=120"`
+	UUID     string `validate:"uuid"`
+	Website  string `validate:"url"`
+}
+
+// Direct programmatic validation
+if err := duosql.Validate(req); err != nil {
+	var ve duosql.ValidationErrors
+	if errors.As(err, &ve) {
+		log.Println(ve.FieldErrors()) // map[string]string for clean JSON API errors
+	}
+}
+
+// InsertBuilder automatically intercepts and validates before execution:
+_, err = duosql.Insert[RegisterRequest](db).Values(req).Exec(ctx)
+// Or bypass explicitly when loading trusted system records:
+// duosql.Insert[RegisterRequest](db).Values(req).SkipValidation().Exec(ctx)
+```
+
+### 11. Native Protobuf Wire Format Support
+
+Seamlessly serialize and deserialize `google.golang.org/protobuf/proto.Message` instances into `BLOB` (SQLite) / `BYTEA` (PostgreSQL) columns:
+
+```go
+type SessionState struct {
+	ID        int64                   `duo:"id,pk,auto"`
+	UserID    string                  `duo:"user_id,index"`
+	Payload   *wrapperspb.StringValue `duo:"payload,proto"`
+	Timestamp *timestamppb.Timestamp  `duo:"stamp,proto"`
+}
+
+// Insert automatically marshals proto wire format
+_, err = duosql.Insert[SessionState](db).Values(&SessionState{
+	UserID:  "usr_99",
+	Payload: wrapperspb.String("active-payload"),
+	Timestamp: timestamppb.Now(),
+}).Exec(ctx)
+
+// Select automatically unmarshals into concrete protobuf pointers
+session, err := duosql.Select[SessionState](db).Where(duosql.Eq("user_id", "usr_99")).One(ctx)
+log.Println(session.Payload.Value)
+```
+
+### 12. Declarative Indexing & Single-Line Model Migration
+
+```go
+type CatalogItem struct {
+	ID       int64  `duo:"id,pk,auto"`
+	SKU      string `duo:"sku,unique"`
+	Category string `duo:"category,index"`
+	Status   string `duo:"status,index:idx_item_status"`
+}
+
+// Generate table, data types, primary keys, and indexes in a single line!
+err := duosql.CreateTableFromModel[CatalogItem](ctx, db.Schema(), true)
+
+// Fluent Index Builder & Partial Indexes
+err = db.Schema().CreateIndex("idx_catalog_active").
+	On("catalog_items", "category").
+	Where("status = 'active'").
+	Exec(ctx)
+
+// Dialect-aware existence checking & dropping
+exists, err := db.Schema().HasIndex(ctx, "catalog_items", "idx_catalog_active")
+err = db.Schema().DropIndex("idx_catalog_active").IfExists().Exec(ctx)
+```
+
 ## Features
 
 - Unified PostgreSQL & SQLite Dialects (`$1` vs `?` placeholders, quoting, type coercions)

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/thruqe/duosql"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 type UserProfile struct {
@@ -1076,6 +1078,61 @@ func TestLivePostgresUpsertAndTx(t *testing.T) {
 	}
 }
 
+func TestLivePostgresProtoAndIndexing(t *testing.T) {
+	pgDSN := "postgres://thruqe:postgres@localhost:5432/duosql_test?sslmode=disable"
+	db, err := duosql.Open(duosql.DialectPostgres, pgDSN)
+	if err != nil {
+		t.Skipf("skipping live postgres proto/index test: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.Ping(ctx); err != nil {
+		t.Skipf("skipping live postgres test (ping failed): %v", err)
+	}
+
+	_ = db.Schema().DropTable("indexed_catalog_items").Cascade().IfExists().Exec(ctx)
+	_ = db.Schema().DropTable("proto_users").Cascade().IfExists().Exec(ctx)
+
+	// 1. Create table from model with indexes on Postgres
+	err = duosql.CreateTableFromModel[IndexedCatalogItem](ctx, db.Schema(), true)
+	if err != nil {
+		t.Fatalf("postgres CreateTableFromModel failed: %v", err)
+	}
+	defer func() { _ = db.Schema().DropTable("indexed_catalog_items").Cascade().Exec(ctx) }()
+
+	hasSlugIdx, err := db.Schema().HasIndex(ctx, "indexed_catalog_items", "uniq_indexed_catalog_items_slug")
+	if err != nil || !hasSlugIdx {
+		t.Errorf("postgres: expected uniq slug index: %v", err)
+	}
+
+	// 2. Proto columns on Postgres
+	err = duosql.CreateTableFromModel[ProtoUser](ctx, db.Schema(), true)
+	if err != nil {
+		t.Fatalf("postgres CreateTableFromModel ProtoUser failed: %v", err)
+	}
+	defer func() { _ = db.Schema().DropTable("proto_users").Cascade().Exec(ctx) }()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	pUser := &ProtoUser{
+		Name:    "PG Proto Master",
+		Payload: wrapperspb.String("pg-proto-content"),
+		Stamp:   timestamppb.New(now),
+	}
+	_, err = duosql.Insert[ProtoUser](db).Values(pUser).Exec(ctx)
+	if err != nil {
+		t.Fatalf("postgres insert proto user failed: %v", err)
+	}
+
+	fetched, err := duosql.Select[ProtoUser](db).Where(duosql.Eq("name", "PG Proto Master")).One(ctx)
+	if err != nil {
+		t.Fatalf("postgres fetch proto user failed: %v", err)
+	}
+	if fetched.Payload == nil || fetched.Payload.Value != "pg-proto-content" {
+		t.Fatalf("postgres unexpected fetched proto payload: %+v", fetched.Payload)
+	}
+}
+
 func TestAutomaticTimestampsAndUpsertAll(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
@@ -1185,4 +1242,195 @@ func stringSearch(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+type ValidatedUser struct {
+	ID    int64  `duo:"id,pk,auto"`
+	Name  string `duo:"name" validate:"required,min=3,max=50"`
+	Email string `duo:"email" validate:"required,email"`
+	Role  string `duo:"role" validate:"in=admin|user|guest"`
+	UUID  string `duo:"uuid" validate:"uuid"`
+	Age   int    `duo:"age" validate:"min=18,max=120"`
+}
+
+func (ValidatedUser) TableName() string { return "validated_users" }
+
+func TestBuiltinValidation(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	invalid := &ValidatedUser{
+		Name:  "al",
+		Email: "not-an-email",
+		Role:  "superuser",
+		UUID:  "123-bad",
+		Age:   15,
+	}
+	err := duosql.Validate(invalid)
+	if err == nil {
+		t.Fatalf("expected validation failure for invalid user")
+	}
+	var ve duosql.ValidationErrors
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected ValidationErrors type, got %T", err)
+	}
+	fieldErrs := ve.FieldErrors()
+	if fieldErrs["name"] == "" || fieldErrs["email"] == "" || fieldErrs["role"] == "" || fieldErrs["age"] == "" {
+		t.Errorf("missing expected field error keys: %+v", fieldErrs)
+	}
+
+	_, err = duosql.Insert[ValidatedUser](db).Values(invalid).Exec(ctx)
+	if err == nil {
+		t.Fatalf("expected Insert to reject invalid model before execution")
+	}
+
+	_ = db.Schema().CreateTableIfNotExists("validated_users", func(tb *duosql.TableBuilder) {
+		tb.ID()
+		tb.String("name")
+		tb.String("email")
+		tb.String("role")
+		tb.String("uuid")
+		tb.Int("age")
+	}).Exec(ctx)
+
+	valid := &ValidatedUser{
+		Name:  "Alice",
+		Email: "alice@example.com",
+		Role:  "admin",
+		UUID:  "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+		Age:   28,
+	}
+	_, err = duosql.Insert[ValidatedUser](db).Values(valid).Exec(ctx)
+	if err != nil {
+		t.Fatalf("insert valid user failed: %v", err)
+	}
+
+	// 4. SkipValidation permits execution of invalid entity
+	_, err = duosql.Insert[ValidatedUser](db).Values(invalid).SkipValidation().Exec(ctx)
+	if err != nil {
+		t.Fatalf("expected SkipValidation to permit insert: %v", err)
+	}
+}
+
+type ProtoUser struct {
+	ID      int64                   `duo:"id,pk,auto"`
+	Name    string                  `duo:"name"`
+	Payload *wrapperspb.StringValue `duo:"payload,proto"`
+	Stamp   *timestamppb.Timestamp  `duo:"stamp,proto"`
+}
+
+func (ProtoUser) TableName() string { return "proto_users" }
+
+func TestProtobufSupport(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	err := db.Schema().CreateTable("proto_users", func(tb *duosql.TableBuilder) {
+		tb.ID()
+		tb.String("name")
+		tb.Proto("payload")
+		tb.Proto("stamp")
+	}).Exec(ctx)
+	if err != nil {
+		t.Fatalf("create proto_users table failed: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	pUser := &ProtoUser{
+		Name:    "Protobuf Hero",
+		Payload: wrapperspb.String("duosql-proto-payload-test"),
+		Stamp:   timestamppb.New(now),
+	}
+
+	_, err = duosql.Insert[ProtoUser](db).Values(pUser).Exec(ctx)
+	if err != nil {
+		t.Fatalf("insert proto user failed: %v", err)
+	}
+
+	fetched, err := duosql.Select[ProtoUser](db).Where(duosql.Eq("name", "Protobuf Hero")).One(ctx)
+	if err != nil {
+		t.Fatalf("fetch proto user failed: %v", err)
+	}
+	if fetched.Payload == nil || fetched.Payload.Value != "duosql-proto-payload-test" {
+		t.Fatalf("unexpected fetched proto payload: %+v", fetched.Payload)
+	}
+	if fetched.Stamp == nil || fetched.Stamp.AsTime().Unix() != now.Unix() {
+		t.Fatalf("unexpected fetched proto stamp: %+v", fetched.Stamp)
+	}
+
+	newPayload := wrapperspb.String("duosql-proto-updated")
+	_, err = duosql.Update[ProtoUser](db).
+		Set("payload", newPayload).
+		Where(duosql.Eq("id", fetched.ID)).
+		Exec(ctx)
+	if err != nil {
+		t.Fatalf("update proto column failed: %v", err)
+	}
+
+	updated, err := duosql.Select[ProtoUser](db).Where(duosql.Eq("id", fetched.ID)).One(ctx)
+	if err != nil {
+		t.Fatalf("fetch updated proto user failed: %v", err)
+	}
+	if updated.Payload.Value != "duosql-proto-updated" {
+		t.Errorf("expected updated proto payload 'duosql-proto-updated', got %q", updated.Payload.Value)
+	}
+}
+
+type IndexedCatalogItem struct {
+	ID       int64  `duo:"id,pk,auto"`
+	Slug     string `duo:"slug,unique"`
+	Category string `duo:"category,index"`
+	Status   string `duo:"status,index:idx_item_status"`
+}
+
+func (IndexedCatalogItem) TableName() string { return "indexed_catalog_items" }
+
+func TestIndexingAndSchemaFromModel(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	err := duosql.CreateTableFromModel[IndexedCatalogItem](ctx, db.Schema(), true)
+	if err != nil {
+		t.Fatalf("CreateTableFromModel failed: %v", err)
+	}
+
+	hasTable, err := db.Schema().HasTable(ctx, "indexed_catalog_items")
+	if err != nil || !hasTable {
+		t.Fatalf("expected indexed_catalog_items table to exist: %v", err)
+	}
+
+	hasSlugIdx, err := db.Schema().HasIndex(ctx, "indexed_catalog_items", "uniq_indexed_catalog_items_slug")
+	if err != nil || !hasSlugIdx {
+		t.Errorf("expected uniq slug index to exist: has=%v, err=%v", hasSlugIdx, err)
+	}
+
+	hasStatusIdx, err := db.Schema().HasIndex(ctx, "indexed_catalog_items", "idx_item_status")
+	if err != nil || !hasStatusIdx {
+		t.Errorf("expected idx_item_status to exist: has=%v, err=%v", hasStatusIdx, err)
+	}
+
+	err = db.Schema().CreateIndex("idx_catalog_partial").
+		On("indexed_catalog_items", "category").
+		Where("status = 'active'").
+		Exec(ctx)
+	if err != nil {
+		t.Fatalf("create partial index failed: %v", err)
+	}
+
+	hasPartial, err := db.Schema().HasIndex(ctx, "indexed_catalog_items", "idx_catalog_partial")
+	if err != nil || !hasPartial {
+		t.Errorf("expected partial index to exist: %v", err)
+	}
+
+	err = db.Schema().DropIndex("idx_catalog_partial").IfExists().Exec(ctx)
+	if err != nil {
+		t.Fatalf("drop index failed: %v", err)
+	}
+	hasAfterDrop, _ := db.Schema().HasIndex(ctx, "indexed_catalog_items", "idx_catalog_partial")
+	if hasAfterDrop {
+		t.Errorf("expected partial index to be removed after drop")
+	}
 }

@@ -12,16 +12,27 @@ import (
 
 // FieldInfo stores parsed struct field metadata cached across query executions.
 type FieldInfo struct {
-	Index        int
-	Name         string
-	ColumnName   string
-	IsPrimaryKey bool
-	IsAuto       bool
-	IsJSON       bool
-	IsSoftDelete bool
-	IsCreatedAt  bool
-	IsUpdatedAt  bool
-	FieldType    reflect.Type
+	Index         int
+	Name          string
+	ColumnName    string
+	IsPrimaryKey  bool
+	IsAuto        bool
+	IsJSON        bool
+	IsProto       bool
+	IsSoftDelete  bool
+	IsCreatedAt   bool
+	IsUpdatedAt   bool
+	IsIndex       bool
+	IsUniqueIndex bool
+	IndexName     string
+	FieldType     reflect.Type
+}
+
+// ModelIndex specifies an index declared via struct tags.
+type ModelIndex struct {
+	Name    string
+	Columns []string
+	Unique  bool
 }
 
 // ModelMetadata represents the cached structural blueprint of a Go entity struct.
@@ -34,6 +45,7 @@ type ModelMetadata struct {
 	SoftDeleteColumn string
 	CreatedAtCol     string
 	UpdatedAtCol     string
+	Indexes          []ModelIndex
 }
 
 var modelCache sync.Map // map[reflect.Type]*ModelMetadata
@@ -107,6 +119,21 @@ func assignSpecialColumns(meta *ModelMetadata, info FieldInfo) {
 	if info.IsUpdatedAt && meta.UpdatedAtCol == "" {
 		meta.UpdatedAtCol = info.ColumnName
 	}
+	if info.IsIndex {
+		idxName := info.IndexName
+		if idxName == "" {
+			prefix := "idx"
+			if info.IsUniqueIndex {
+				prefix = "uniq"
+			}
+			idxName = fmt.Sprintf("%s_%s_%s", prefix, meta.TableName, info.ColumnName)
+		}
+		meta.Indexes = append(meta.Indexes, ModelIndex{
+			Name:    idxName,
+			Columns: []string{info.ColumnName},
+			Unique:  info.IsUniqueIndex,
+		})
+	}
 }
 
 func applyIdConvention(meta *ModelMetadata) {
@@ -124,65 +151,85 @@ func parseFieldInfo(idx int, field reflect.StructField) FieldInfo {
 		tag = field.Tag.Get("db")
 	}
 
-	colName, isPK, isAuto, isJSON, isSoft, isCreated, isUpdated := parseTagOptions(tag, field.Name)
-
-	return FieldInfo{
-		Index:        idx,
-		Name:         field.Name,
-		ColumnName:   colName,
-		IsPrimaryKey: isPK,
-		IsAuto:       isAuto,
-		IsJSON:       isJSON,
-		IsSoftDelete: isSoft,
-		IsCreatedAt:  isCreated,
-		IsUpdatedAt:  isUpdated,
-		FieldType:    field.Type,
+	info := parseTagOptions(tag, field.Name)
+	info.Index = idx
+	info.Name = field.Name
+	info.FieldType = field.Type
+	if isProtoType(field.Type) {
+		info.IsProto = true
 	}
+	return info
 }
 
-func parseTagOptions(tag, fieldName string) (string, bool, bool, bool, bool, bool, bool) {
-	colName := ""
-	isPK := false
-	isAuto := false
-	isJSON := false
-	isSoft := false
-	isCreated := false
-	isUpdated := false
-
+func parseTagOptions(tag, fieldName string) FieldInfo {
+	var info FieldInfo
 	if tag != "" {
 		parts := strings.Split(tag, ",")
-		colName = strings.TrimSpace(parts[0])
+		info.ColumnName = strings.TrimSpace(parts[0])
 		for _, opt := range parts[1:] {
-			switch strings.ToLower(strings.TrimSpace(opt)) {
-			case "pk":
-				isPK = true
-			case "auto":
-				isAuto = true
-			case "json":
-				isJSON = true
-			case "soft_delete", "softdelete":
-				isSoft = true
-			case "created_at", "createdat", "auto_now_add":
-				isCreated = true
-			case "updated_at", "updatedat", "auto_now":
-				isUpdated = true
-			}
+			applyTagOption(strings.TrimSpace(opt), &info)
 		}
 	}
 
-	if colName == "" {
-		colName = toSnakeCase(fieldName)
+	if info.ColumnName == "" {
+		info.ColumnName = toSnakeCase(fieldName)
 	}
 
-	lowerCol := strings.ToLower(colName)
+	lowerCol := strings.ToLower(info.ColumnName)
 	if lowerCol == "created_at" || strings.EqualFold(fieldName, "CreatedAt") {
-		isCreated = true
+		info.IsCreatedAt = true
 	}
 	if lowerCol == "updated_at" || strings.EqualFold(fieldName, "UpdatedAt") {
-		isUpdated = true
+		info.IsUpdatedAt = true
 	}
 
-	return colName, isPK, isAuto, isJSON, isSoft, isCreated, isUpdated
+	return info
+}
+
+func applyTagOption(opt string, info *FieldInfo) {
+	lower := strings.ToLower(opt)
+	if applyIndexTagOption(opt, lower, info) {
+		return
+	}
+	switch lower {
+	case "pk":
+		info.IsPrimaryKey = true
+	case "auto":
+		info.IsAuto = true
+	case "json":
+		info.IsJSON = true
+	case "proto":
+		info.IsProto = true
+	case "soft_delete", "softdelete":
+		info.IsSoftDelete = true
+	case "created_at", "createdat", "auto_now_add":
+		info.IsCreatedAt = true
+	case "updated_at", "updatedat", "auto_now":
+		info.IsUpdatedAt = true
+	}
+}
+
+func applyIndexTagOption(opt, lower string, info *FieldInfo) bool {
+	switch {
+	case lower == "unique" || lower == "unique_index":
+		info.IsUniqueIndex = true
+		info.IsIndex = true
+		return true
+	case strings.HasPrefix(lower, "unique:"):
+		info.IsUniqueIndex = true
+		info.IsIndex = true
+		info.IndexName = opt[7:]
+		return true
+	case lower == "index":
+		info.IsIndex = true
+		return true
+	case strings.HasPrefix(lower, "index:"):
+		info.IsIndex = true
+		info.IndexName = opt[6:]
+		return true
+	default:
+		return false
+	}
 }
 
 // ColumnNames returns all declared column names in the model.
@@ -229,6 +276,19 @@ func (m *ModelMetadata) ExtractInsertMap(val reflect.Value, skipAuto bool) map[s
 				continue
 			}
 		}
+
+		if f.IsProto {
+			if fieldVal.Kind() == reflect.Pointer && fieldVal.IsNil() {
+				data[f.ColumnName] = nil
+				continue
+			}
+			bytes, err := marshalProto(fieldVal.Interface())
+			if err == nil {
+				data[f.ColumnName] = bytes
+				continue
+			}
+		}
+
 		data[f.ColumnName] = fieldVal.Interface()
 	}
 	return data
@@ -257,13 +317,14 @@ func applyTimestamp(fieldVal reflect.Value, now time.Time, data map[string]any, 
 
 // ScanTargets prepares scan destination pointers for the SQL driver's Rows.Scan
 // matching the specific columns returned by the executed query.
-func (m *ModelMetadata) ScanTargets(val reflect.Value, columns []string) ([]any, []jsonScannerTarget) {
+func (m *ModelMetadata) ScanTargets(val reflect.Value, columns []string) ([]any, []jsonScannerTarget, []protoScannerTarget) {
 	for val.Kind() == reflect.Pointer {
 		val = val.Elem()
 	}
 
 	targets := make([]any, len(columns))
 	var jsonTargets []jsonScannerTarget
+	var protoTargets []protoScannerTarget
 
 	for i, col := range columns {
 		idx, found := m.ColumnToIdx[col]
@@ -287,6 +348,16 @@ func (m *ModelMetadata) ScanTargets(val reflect.Value, columns []string) ([]any,
 			continue
 		}
 
+		if field.IsProto {
+			var raw []byte
+			targets[i] = &raw
+			protoTargets = append(protoTargets, protoScannerTarget{
+				fieldVal: fieldVal,
+				rawBytes: &raw,
+			})
+			continue
+		}
+
 		if field.FieldType == timeType {
 			targets[i] = &timeScanner{dest: fieldVal.Addr().Interface().(*time.Time)}
 			continue
@@ -299,7 +370,7 @@ func (m *ModelMetadata) ScanTargets(val reflect.Value, columns []string) ([]any,
 		targets[i] = fieldVal.Addr().Interface()
 	}
 
-	return targets, jsonTargets
+	return targets, jsonTargets, protoTargets
 }
 
 var (
@@ -399,18 +470,36 @@ func (j *jsonScannerTarget) apply() error {
 	return nil
 }
 
+type protoScannerTarget struct {
+	fieldVal reflect.Value
+	rawBytes *[]byte
+}
+
+func (p *protoScannerTarget) apply() error {
+	if p.rawBytes == nil || len(*p.rawBytes) == 0 {
+		return nil
+	}
+	return unmarshalProto(*p.rawBytes, p.fieldVal)
+}
+
 // ScanModel scans a single row from *sql.Rows into a fresh instance of T.
 func ScanModel[T any](rows *sql.Rows, columns []string, meta *ModelMetadata) (*T, error) {
 	item := new(T)
 	val := reflect.ValueOf(item).Elem()
 
-	targets, jsonTargets := meta.ScanTargets(val, columns)
+	targets, jsonTargets, protoTargets := meta.ScanTargets(val, columns)
 	if err := rows.Scan(targets...); err != nil {
 		return nil, fmt.Errorf("duosql: scan row: %w", err)
 	}
 
 	for _, jt := range jsonTargets {
 		if err := jt.apply(); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, pt := range protoTargets {
+		if err := pt.apply(); err != nil {
 			return nil, err
 		}
 	}

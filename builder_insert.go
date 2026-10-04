@@ -23,6 +23,27 @@ type InsertBuilder[T any] struct {
 	conflictUpdates       []string
 	conflictRawUpdates    []string
 	returningCols         []string
+	skipValidation        bool
+}
+
+// SkipValidation disables automatic struct tag and validator hook executions before insert.
+func (b *InsertBuilder[T]) SkipValidation() *InsertBuilder[T] {
+	b.skipValidation = true
+	return b
+}
+
+func (b *InsertBuilder[T]) validateModels(ctx context.Context) error {
+	if b.skipValidation {
+		return nil
+	}
+	for _, m := range b.models {
+		if m != nil {
+			if err := ValidateContext(ctx, m); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Insert creates a new insert query builder for entity type T.
@@ -312,6 +333,9 @@ func (b *InsertBuilder[T]) compileReturning(d Dialect) string {
 
 // Exec executes the insertion command, returning the standard sql.Result.
 func (b *InsertBuilder[T]) Exec(ctx context.Context) (sql.Result, error) {
+	if err := b.validateModels(ctx); err != nil {
+		return nil, err
+	}
 	query, args, err := b.Build()
 	if err != nil {
 		return nil, err
@@ -321,6 +345,9 @@ func (b *InsertBuilder[T]) Exec(ctx context.Context) (sql.Result, error) {
 
 // One executes the insertion with a RETURNING clause and unmarshals the resulting entity.
 func (b *InsertBuilder[T]) One(ctx context.Context) (*T, error) {
+	if err := b.validateModels(ctx); err != nil {
+		return nil, err
+	}
 	if len(b.returningCols) == 0 {
 		b.Returning("*")
 	}
@@ -358,6 +385,9 @@ func (b *InsertBuilder[T]) One(ctx context.Context) (*T, error) {
 
 // All executes a batch insertion with RETURNING and unmarshals all persisted entities.
 func (b *InsertBuilder[T]) All(ctx context.Context) ([]T, error) {
+	if err := b.validateModels(ctx); err != nil {
+		return nil, err
+	}
 	if len(b.returningCols) == 0 {
 		b.Returning("*")
 	}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 )
 
@@ -47,6 +48,13 @@ type ForeignKeyDef struct {
 	OnUpdateAction   string
 }
 
+type tableIndexDef struct {
+	name    string
+	columns []string
+	unique  bool
+	where   string
+}
+
 // TableBuilder records column declarations and table-level constraints during DDL construction.
 type TableBuilder struct {
 	tableName    string
@@ -54,6 +62,7 @@ type TableBuilder struct {
 	foreignKeys  []*ForeignKeyDef
 	compositePKs []string
 	uniqueGroups [][]string
+	indexes      []*tableIndexDef
 }
 
 // ColumnBuilder provides a fluent interface for configuring column metadata.
@@ -309,6 +318,30 @@ func (t *TableBuilder) Timestamps() {
 	t.Timestamp("updated_at").NotNull().Default("CURRENT_TIMESTAMP")
 }
 
+// Index registers a named index on the table.
+func (t *TableBuilder) Index(name string, cols ...string) *TableBuilder {
+	t.indexes = append(t.indexes, &tableIndexDef{
+		name:    name,
+		columns: cols,
+	})
+	return t
+}
+
+// UniqueIndex registers a named unique index on the table.
+func (t *TableBuilder) UniqueIndex(name string, cols ...string) *TableBuilder {
+	t.indexes = append(t.indexes, &tableIndexDef{
+		name:    name,
+		columns: cols,
+		unique:  true,
+	})
+	return t
+}
+
+// Proto registers a binary protobuf wire column (PostgreSQL BYTEA, SQLite BLOB).
+func (t *TableBuilder) Proto(name string) *ColumnBuilder {
+	return t.Bytes(name)
+}
+
 // SchemaBuilder provides DDL execution workflows for database migrations.
 type SchemaBuilder struct {
 	executor ExecExecutor
@@ -331,6 +364,11 @@ func (s *SchemaBuilder) CreateTable(name string, fn func(t *TableBuilder)) *Crea
 		schema: s,
 		table:  tb,
 	}
+}
+
+// CreateTableIfNotExists initiates table definition with IF NOT EXISTS automatically enabled.
+func (s *SchemaBuilder) CreateTableIfNotExists(name string, fn func(t *TableBuilder)) *CreateTableBuilder {
+	return s.CreateTable(name, fn).IfNotExists()
 }
 
 // DropTable initiates a table removal statement.
@@ -406,6 +444,50 @@ func (s *SchemaBuilder) HasColumn(ctx context.Context, tableName, columnName str
 	return exists, err
 }
 
+// HasIndex reports whether the specified index exists on the database table.
+func (s *SchemaBuilder) HasIndex(ctx context.Context, tableName, indexName string) (bool, error) {
+	if s.dialect.Kind() == DialectSQLite {
+		rows, err := s.executor.QueryContext(ctx, fmt.Sprintf("PRAGMA index_list(%s)", s.dialect.QuoteIdentifier(tableName)))
+		if err != nil {
+			return false, err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var seq int
+			var name string
+			var unique int
+			var origin string
+			var partial int
+			if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err == nil {
+				if strings.EqualFold(name, indexName) {
+					return true, nil
+				}
+			}
+		}
+		return false, rows.Err()
+	}
+
+	var exists bool
+	err := s.executor.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_indexes 
+			WHERE (schemaname = current_schema() OR schemaname = 'public') 
+			  AND LOWER(tablename) = $1 
+			  AND LOWER(indexname) = $2
+		)
+	`, strings.ToLower(tableName), strings.ToLower(indexName)).Scan(&exists)
+	return exists, err
+}
+
+// DropIndex initiates an index removal statement.
+func (s *SchemaBuilder) DropIndex(name string) *DropIndexBuilder {
+	return &DropIndexBuilder{
+		schema: s,
+		name:   name,
+	}
+}
+
 // CreateTableBuilder compiles and executes table creation DDL.
 type CreateTableBuilder struct {
 	schema      *SchemaBuilder
@@ -475,7 +557,7 @@ func (b *CreateTableBuilder) Build() (string, error) {
 	return sqlStr, nil
 }
 
-// Exec executes the table creation statement against the database.
+// Exec executes the table creation statement against the database and provisions declared indexes.
 func (b *CreateTableBuilder) Exec(ctx context.Context) error {
 	query, err := b.Build()
 	if err != nil {
@@ -484,6 +566,19 @@ func (b *CreateTableBuilder) Exec(ctx context.Context) error {
 	_, err = b.schema.executor.ExecContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("duosql: execute create table: %w", err)
+	}
+
+	for _, idx := range b.table.indexes {
+		ib := b.schema.CreateIndex(idx.name).On(b.table.tableName, idx.columns...).IfNotExists()
+		if idx.unique {
+			ib.Unique()
+		}
+		if idx.where != "" {
+			ib.Where(idx.where)
+		}
+		if err := ib.Exec(ctx); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -540,6 +635,7 @@ type CreateIndexBuilder struct {
 	columns     []string
 	isUnique    bool
 	ifNotExists bool
+	where       string
 }
 
 // On binds the target table and columns to index.
@@ -558,6 +654,12 @@ func (b *CreateIndexBuilder) Unique() *CreateIndexBuilder {
 // IfNotExists prevents errors if the index already exists.
 func (b *CreateIndexBuilder) IfNotExists() *CreateIndexBuilder {
 	b.ifNotExists = true
+	return b
+}
+
+// Where specifies a partial index predicate expression.
+func (b *CreateIndexBuilder) Where(condition string) *CreateIndexBuilder {
+	b.where = condition
 	return b
 }
 
@@ -583,8 +685,11 @@ func (b *CreateIndexBuilder) Build() (string, error) {
 	for _, col := range b.columns {
 		quotedCols = append(quotedCols, d.QuoteIdentifier(col))
 	}
-	parts = append(parts, fmt.Sprintf("(%s);", strings.Join(quotedCols, ", ")))
-	return strings.Join(parts, " "), nil
+	parts = append(parts, fmt.Sprintf("(%s)", strings.Join(quotedCols, ", ")))
+	if b.where != "" {
+		parts = append(parts, fmt.Sprintf("WHERE %s", b.where))
+	}
+	return strings.Join(parts, " ") + ";", nil
 }
 
 // Exec executes the index creation.
@@ -598,6 +703,120 @@ func (b *CreateIndexBuilder) Exec(ctx context.Context) error {
 		return fmt.Errorf("duosql: execute create index: %w", err)
 	}
 	return nil
+}
+
+// DropIndexBuilder compiles DROP INDEX statements.
+type DropIndexBuilder struct {
+	schema   *SchemaBuilder
+	name     string
+	ifExists bool
+	cascade  bool
+}
+
+// IfExists prevents errors if the index does not exist.
+func (b *DropIndexBuilder) IfExists() *DropIndexBuilder {
+	b.ifExists = true
+	return b
+}
+
+// Cascade drops objects that depend on this index (PostgreSQL).
+func (b *DropIndexBuilder) Cascade() *DropIndexBuilder {
+	b.cascade = true
+	return b
+}
+
+// Build generates the DROP INDEX SQL statement.
+func (b *DropIndexBuilder) Build() string {
+	var parts []string
+	parts = append(parts, "DROP INDEX")
+	if b.ifExists {
+		parts = append(parts, "IF EXISTS")
+	}
+	parts = append(parts, b.schema.dialect.QuoteIdentifier(b.name))
+	if b.cascade && b.schema.dialect.Kind() == DialectPostgres {
+		parts = append(parts, "CASCADE")
+	}
+	return strings.Join(parts, " ") + ";"
+}
+
+// Exec executes index removal.
+func (b *DropIndexBuilder) Exec(ctx context.Context) error {
+	query := b.Build()
+	_, err := b.schema.executor.ExecContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("duosql: execute drop index: %w", err)
+	}
+	return nil
+}
+
+// CreateTableFromModel generates and executes table schema and declared indexes from struct type T.
+func CreateTableFromModel[T any](ctx context.Context, s *SchemaBuilder, ifNotExists ...bool) error {
+	meta, err := GetModelMetadata[T]()
+	if err != nil {
+		return err
+	}
+
+	tb := s.CreateTable(meta.TableName, func(t *TableBuilder) {
+		for _, f := range meta.Fields {
+			col := buildColumnFromField(t, f)
+			if f.IsPrimaryKey {
+				if f.IsAuto {
+					col.AutoIncrement()
+				} else {
+					col.PrimaryKey()
+				}
+			}
+			if f.IsUniqueIndex {
+				col.Unique()
+			}
+		}
+		for _, idx := range meta.Indexes {
+			if idx.Unique {
+				t.UniqueIndex(idx.Name, idx.Columns...)
+			} else {
+				t.Index(idx.Name, idx.Columns...)
+			}
+		}
+	})
+
+	if len(ifNotExists) > 0 && ifNotExists[0] {
+		tb.IfNotExists()
+	}
+	return tb.Exec(ctx)
+}
+
+func buildColumnFromField(t *TableBuilder, f FieldInfo) *ColumnBuilder {
+	if f.IsProto {
+		return t.Bytes(f.ColumnName)
+	}
+	if f.IsJSON {
+		return t.JSON(f.ColumnName)
+	}
+	if f.FieldType == timeType || f.FieldType == timePtrType {
+		return t.Timestamp(f.ColumnName)
+	}
+
+	switch f.FieldType.Kind() {
+	case reflect.Int, reflect.Int32:
+		return t.Int(f.ColumnName)
+	case reflect.Int64:
+		return t.BigInt(f.ColumnName)
+	case reflect.Int16:
+		return t.SmallInt(f.ColumnName)
+	case reflect.Float32:
+		return t.Float(f.ColumnName)
+	case reflect.Float64:
+		return t.Double(f.ColumnName)
+	case reflect.Bool:
+		return t.Bool(f.ColumnName)
+	case reflect.Slice:
+		if f.FieldType.Elem().Kind() == reflect.Uint8 {
+			return t.Bytes(f.ColumnName)
+		}
+		return t.JSON(f.ColumnName)
+	default:
+		return t.Text(f.ColumnName)
+	}
 }
 
 type alterActionKind int
